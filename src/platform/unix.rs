@@ -23,7 +23,7 @@ use crate::{
 #[cfg(feature = "x11")]
 use crate::dpi::Size;
 #[cfg(feature = "x11")]
-use crate::platform_impl::x11::{ffi::XVisualInfo, XConnection};
+use crate::platform_impl::{x11::ffi::XVisualInfo, x11::XConnection, XLIB_ERROR_HOOKS};
 use crate::platform_impl::{
     ApplicationName, Backend, EventLoopWindowTarget as LinuxEventLoopWindowTarget,
     Window as LinuxWindow,
@@ -39,13 +39,38 @@ pub use crate::platform_impl::{x11::util::WindowType as XWindowType, XNotSupport
 #[cfg(feature = "wayland")]
 pub use crate::window::Theme;
 
-/// Additional methods on `EventLoopWindowTarget` that are specific to Unix.
+/// The first argument in the provided hook will be the pointer to `XDisplay`
+/// and the second one the pointer to [`XErrorEvent`]. The returned `bool` is an
+/// indicator whether the error was handled by the callback.
+///
+/// [`XErrorEvent`]: https://linux.die.net/man/3/xerrorevent
+#[cfg(feature = "x11")]
+pub type XlibErrorHook =
+    Box<dyn Fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> bool + Send + Sync>;
+
+/// Hook to winit's xlib error handling callback.
+///
+/// This method is provided as a safe way to handle the errors comming from X11 when using xlib
+/// in external crates, like glutin for GLX access. Trying to handle errors by speculating with
+/// `XSetErrorHandler` is [`unsafe`].
+///
+/// [`unsafe`]: https://www.remlab.net/op/xlib.shtml
+#[inline]
+#[cfg(feature = "x11")]
+pub fn register_xlib_error_hook(hook: XlibErrorHook) {
+    // Append new hook.
+    unsafe {
+        XLIB_ERROR_HOOKS.lock().push(hook);
+    }
+}
+
+/// Additional methods on [`EventLoopWindowTarget`] that are specific to Unix.
 pub trait EventLoopWindowTargetExtUnix {
-    /// True if the `EventLoopWindowTarget` uses Wayland.
+    /// True if the [`EventLoopWindowTarget`] uses Wayland.
     #[cfg(feature = "wayland")]
     fn is_wayland(&self) -> bool;
 
-    /// True if the `EventLoopWindowTarget` uses X11.
+    /// True if the [`EventLoopWindowTarget`] uses X11.
     #[cfg(feature = "x11")]
     fn is_x11(&self) -> bool;
 
@@ -54,11 +79,13 @@ pub trait EventLoopWindowTargetExtUnix {
     fn xlib_xconnection(&self) -> Option<Arc<XConnection>>;
 
     /// Returns a pointer to the `wl_display` object of wayland that is used by this
-    /// `EventLoopWindowTarget`.
+    /// [`EventLoopWindowTarget`].
     ///
-    /// Returns `None` if the `EventLoop` doesn't use wayland (if it uses xlib for example).
+    /// Returns `None` if the [`EventLoop`] doesn't use wayland (if it uses xlib for example).
     ///
-    /// The pointer will become invalid when the winit `EventLoop` is destroyed.
+    /// The pointer will become invalid when the winit [`EventLoop`] is destroyed.
+    ///
+    /// [`EventLoop`]: crate::event_loop::EventLoop
     #[cfg(feature = "wayland")]
     fn wayland_display(&self) -> Option<*mut raw::c_void>;
 }
@@ -138,9 +165,9 @@ impl<T> EventLoopBuilderExtUnix for EventLoopBuilder<T> {
     }
 }
 
-/// Additional methods on `Window` that are specific to Unix.
+/// Additional methods on [`Window`] that are specific to Unix.
 pub trait WindowExtUnix {
-    /// Returns the ID of the `Window` xlib object that is used by this window.
+    /// Returns the ID of the [`Window`] xlib object that is used by this window.
     ///
     /// Returns `None` if the window doesn't use xlib (if it uses wayland for example).
     #[cfg(feature = "x11")]
@@ -150,7 +177,7 @@ pub trait WindowExtUnix {
     ///
     /// Returns `None` if the window doesn't use xlib (if it uses wayland for example).
     ///
-    /// The pointer will become invalid when the glutin `Window` is destroyed.
+    /// The pointer will become invalid when the [`Window`] is destroyed.
     #[cfg(feature = "x11")]
     fn xlib_display(&self) -> Option<*mut raw::c_void>;
 
@@ -165,7 +192,7 @@ pub trait WindowExtUnix {
     ///
     /// Returns `None` if the window doesn't use xlib (if it uses wayland for example).
     ///
-    /// The pointer will become invalid when the glutin `Window` is destroyed.
+    /// The pointer will become invalid when the [`Window`] is destroyed.
     #[cfg(feature = "x11")]
     fn xcb_connection(&self) -> Option<*mut raw::c_void>;
 
@@ -173,7 +200,7 @@ pub trait WindowExtUnix {
     ///
     /// Returns `None` if the window doesn't use wayland (if it uses xlib for example).
     ///
-    /// The pointer will become invalid when the glutin `Window` is destroyed.
+    /// The pointer will become invalid when the [`Window`] is destroyed.
     #[cfg(feature = "wayland")]
     fn wayland_surface(&self) -> Option<*mut raw::c_void>;
 
@@ -181,7 +208,7 @@ pub trait WindowExtUnix {
     ///
     /// Returns `None` if the window doesn't use wayland (if it uses xlib for example).
     ///
-    /// The pointer will become invalid when the glutin `Window` is destroyed.
+    /// The pointer will become invalid when the [`Window`] is destroyed.
     #[cfg(feature = "wayland")]
     fn wayland_display(&self) -> Option<*mut raw::c_void>;
 
@@ -197,7 +224,7 @@ pub trait WindowExtUnix {
     /// It is a remnant of a previous implementation detail for the
     /// wayland backend, and is no longer relevant.
     ///
-    /// Always return true.
+    /// Always return `true`.
     #[deprecated]
     fn is_ready(&self) -> bool;
 }
@@ -276,10 +303,11 @@ impl WindowExtUnix for Window {
     #[inline]
     #[cfg(feature = "wayland")]
     fn wayland_set_csd_theme(&self, theme: Theme) {
+        #[allow(clippy::single_match)]
         match self.window {
             LinuxWindow::Wayland(ref w) => w.set_csd_theme(theme),
             #[cfg(feature = "x11")]
-            _ => {}
+            _ => (),
         }
     }
 
@@ -289,7 +317,7 @@ impl WindowExtUnix for Window {
     }
 }
 
-/// Additional methods on `WindowBuilder` that are specific to Unix.
+/// Additional methods on [`WindowBuilder`] that are specific to Unix.
 pub trait WindowBuilderExtUnix {
     #[cfg(feature = "x11")]
     fn with_x11_visual<T>(self, visual_infos: *const T) -> Self;

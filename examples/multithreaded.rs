@@ -143,6 +143,7 @@ fn main() {
                                 };
                                 println!("Picking video mode: {}", video_modes[video_mode_id]);
                             }
+>>>>>>> 2e4338bb8dddf820c9bcda23d6b7a0d8a6208831
                             _ => (),
                         }
                     }

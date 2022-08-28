@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-/// The X11 documentation states: "Keycodes lie in the inclusive range [8,255]".
+/// The X11 documentation states: "Keycodes lie in the inclusive range `[8, 255]`".
 const KEYCODE_OFFSET: u8 = 8;
 
 pub(super) struct EventProcessor<T: 'static> {
@@ -61,7 +61,7 @@ impl<T: 'static> EventProcessor<T> {
         F: Fn(&Arc<UnownedWindow>) -> Ret,
     {
         let mut deleted = false;
-        let window_id = WindowId(window_id);
+        let window_id = WindowId(window_id as u64);
         let wt = get_xtarget(&self.target);
         let result = wt
             .windows
@@ -476,7 +476,7 @@ impl<T: 'static> EventProcessor<T> {
 
                 // In the event that the window's been destroyed without being dropped first, we
                 // cleanup again here.
-                wt.windows.borrow_mut().remove(&WindowId(window));
+                wt.windows.borrow_mut().remove(&WindowId(window as u64));
 
                 // Since all XIM stuff needs to happen from the same thread, we destroy the input
                 // context here instead of when dropping the window.
@@ -494,8 +494,13 @@ impl<T: 'static> EventProcessor<T> {
             ffi::VisibilityNotify => {
                 let xev: &ffi::XVisibilityEvent = xev.as_ref();
                 let xwindow = xev.window;
-
-                self.with_window(xwindow, |window| window.visibility_notify());
+                callback(Event::WindowEvent {
+                    window_id: mkwid(xwindow),
+                    event: WindowEvent::Occluded(xev.state == ffi::VisibilityFullyObscured),
+                });
+                self.with_window(xwindow, |window| {
+                    window.visibility_notify();
+                });
             }
 
             ffi::Expose => {
@@ -1186,11 +1191,7 @@ impl<T: 'static> EventProcessor<T> {
                                                 &*window.shared_state.lock(),
                                             );
 
-                                            let window_id = crate::window::WindowId(
-                                                crate::platform_impl::platform::WindowId::X(
-                                                    *window_id,
-                                                ),
-                                            );
+                                            let window_id = crate::window::WindowId(*window_id);
                                             let old_inner_size = PhysicalSize::new(width, height);
                                             let mut new_inner_size =
                                                 PhysicalSize::new(new_width, new_height);

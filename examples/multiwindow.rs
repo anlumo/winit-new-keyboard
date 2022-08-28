@@ -16,8 +16,11 @@ fn main() {
     let mut windows = HashMap::new();
     for _ in 0..3 {
         let window = Window::new(&event_loop).unwrap();
+        println!("Opened a new window: {:?}", window.id());
         windows.insert(window.id(), window);
     }
+
+    println!("Press N to open a new window.");
 
     event_loop.run(move |event, event_loop, control_flow| {
         control_flow.set_wait();
@@ -41,9 +44,11 @@ fn main() {
                                 state: ElementState::Released,
                                 ..
                             },
+                        is_synthetic: false,
                         ..
                     } => {
                         let window = Window::new(event_loop).unwrap();
+                        println!("Opened a new window: {:?}", window.id());
                         windows.insert(window.id(), window);
                     }
                     _ => (),

@@ -2,8 +2,6 @@
 
 mod runner;
 
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use std::{
     cell::Cell,
     collections::VecDeque,
@@ -18,6 +16,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use raw_window_handle::{RawDisplayHandle, WindowsDisplayHandle};
 
 use windows_sys::Win32::{
     Devices::HumanInterfaceDevice::MOUSE_MOVE_RELATIVE,
@@ -61,7 +63,7 @@ use windows_sys::Win32::{
             WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
             WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
             WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN,
+            WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN,
             WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
             WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
             WM_TOUCH, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP,
@@ -74,7 +76,9 @@ use windows_sys::Win32::{
 use crate::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{DeviceEvent, Event, Force, Ime, RawKeyEvent, Touch, TouchPhase, WindowEvent},
-    event_loop::{ControlFlow, EventLoopClosed, EventLoopWindowTarget as RootELW},
+    event_loop::{
+        ControlFlow, DeviceEventFilter, EventLoopClosed, EventLoopWindowTarget as RootELW,
+    },
     keyboard::{KeyCode, ModifiersState},
     monitor::MonitorHandle as RootMonitorHandle,
     platform::scancode::KeyCodeExtScancode,
@@ -94,6 +98,8 @@ use crate::{
     window::{Fullscreen, WindowId as RootWindowId},
 };
 use runner::{EventLoopRunner, EventLoopRunnerShared};
+
+use super::window::set_skip_taskbar;
 
 type GetPointerFrameInfoHistory = unsafe extern "system" fn(
     pointerId: u32,
@@ -213,7 +219,10 @@ impl<T: 'static> EventLoop<T> {
 
         let thread_msg_sender =
             insert_event_target_window_data::<T>(thread_msg_target, runner_shared.clone());
-        raw_input::register_all_mice_and_keyboards_for_raw_input(thread_msg_target);
+        raw_input::register_all_mice_and_keyboards_for_raw_input(
+            thread_msg_target,
+            Default::default(),
+        );
 
         EventLoop {
             thread_msg_sender,
@@ -324,6 +333,14 @@ impl<T> EventLoopWindowTarget<T> {
         let monitor = monitor::primary_monitor();
         Some(RootMonitorHandle { inner: monitor })
     }
+
+    pub fn raw_display_handle(&self) -> RawDisplayHandle {
+        RawDisplayHandle::Windows(WindowsDisplayHandle::empty())
+    }
+
+    pub fn set_device_event_filter(&self, filter: DeviceEventFilter) {
+        raw_input::register_all_mice_and_keyboards_for_raw_input(self.thread_msg_target, filter);
+    }
 }
 
 /// Returns the id of the main thread.
@@ -343,7 +360,7 @@ impl<T> EventLoopWindowTarget<T> {
 /// entrypoint.
 ///
 /// Full details of CRT initialization can be found here:
-/// https://docs.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization?view=msvc-160
+/// <https://docs.microsoft.com/en-us/cpp/c-runtime-library/crt-initialization?view=msvc-160>
 fn main_thread_id() -> u32 {
     static mut MAIN_THREAD_ID: u32 = 0;
 
@@ -620,6 +637,10 @@ pub static SET_RETAIN_STATE_ON_SIZE_MSG_ID: Lazy<u32> =
     Lazy::new(|| unsafe { RegisterWindowMessageA("Winit::SetRetainMaximized\0".as_ptr()) });
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
+/// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then broadcasts this message to all top-level windows
+/// <https://docs.microsoft.com/en-us/windows/win32/shell/taskbar#taskbar-creation-notification>
+pub static TASKBAR_CREATED: Lazy<u32> =
+    Lazy::new(|| unsafe { RegisterWindowMessageA("TaskbarCreated\0".as_ptr()) });
 
 fn create_event_target_window<T: 'static>() -> HWND {
     unsafe {
@@ -808,7 +829,74 @@ fn update_modifiers<T>(window: HWND, userdata: &WindowData<T>) -> ModifiersState
             });
         }
     }
-    modifiers
+}
+
+unsafe fn gain_active_focus<T>(window: HWND, userdata: &WindowData<T>) {
+    use crate::event::{ElementState::Released, WindowEvent::Focused};
+    for windows_keycode in event::get_pressed_keys() {
+        let scancode = MapVirtualKeyA(windows_keycode as u32, MAPVK_VK_TO_VSC);
+        let virtual_keycode = event::vkey_to_winit_vkey(windows_keycode);
+
+        update_modifiers(window, userdata);
+
+        #[allow(deprecated)]
+        userdata.send_event(Event::WindowEvent {
+            window_id: RootWindowId(WindowId(window)),
+            event: WindowEvent::KeyboardInput {
+                device_id: DEVICE_ID,
+                input: KeyboardInput {
+                    scancode,
+                    virtual_keycode,
+                    state: Released,
+                    modifiers: event::get_key_mods(),
+                },
+                is_synthetic: true,
+            },
+        })
+    }
+
+    userdata.send_event(Event::WindowEvent {
+        window_id: RootWindowId(WindowId(window)),
+        event: Focused(true),
+    });
+}
+
+unsafe fn lose_active_focus<T>(window: HWND, userdata: &WindowData<T>) {
+    use crate::event::{
+        ElementState::Released,
+        ModifiersState,
+        WindowEvent::{Focused, ModifiersChanged},
+    };
+    for windows_keycode in event::get_pressed_keys() {
+        let scancode = MapVirtualKeyA(windows_keycode as u32, MAPVK_VK_TO_VSC);
+        let virtual_keycode = event::vkey_to_winit_vkey(windows_keycode);
+
+        #[allow(deprecated)]
+        userdata.send_event(Event::WindowEvent {
+            window_id: RootWindowId(WindowId(window)),
+            event: WindowEvent::KeyboardInput {
+                device_id: DEVICE_ID,
+                input: KeyboardInput {
+                    scancode,
+                    virtual_keycode,
+                    state: Released,
+                    modifiers: event::get_key_mods(),
+                },
+                is_synthetic: true,
+            },
+        })
+    }
+
+    userdata.window_state.lock().modifiers_state = ModifiersState::empty();
+    userdata.send_event(Event::WindowEvent {
+        window_id: RootWindowId(WindowId(window)),
+        event: ModifiersChanged(ModifiersState::empty()),
+    });
+
+    userdata.send_event(Event::WindowEvent {
+        window_id: RootWindowId(WindowId(window)),
+        event: Focused(false),
+    });
 }
 
 /// Any window whose callback is configured to this function will have its events propagated
@@ -871,7 +959,7 @@ pub(super) unsafe extern "system" fn public_window_callback<T: 'static>(
     };
 
     if userdata_removed && recurse_depth == 0 {
-        Box::from_raw(userdata_ptr);
+        drop(Box::from_raw(userdata_ptr));
     }
 
     result
@@ -1738,32 +1826,33 @@ unsafe fn public_window_callback_inner<T: 'static>(
             result = ProcResult::Value(0);
         }
 
+        WM_NCACTIVATE => {
+            let is_active = wparam == 1;
+            let active_focus_changed = userdata.window_state.lock().set_active(is_active);
+            if active_focus_changed {
+                if is_active {
+                    gain_active_focus(window, userdata);
+                } else {
+                    lose_active_focus(window, userdata);
+                }
+            }
+            DefWindowProcW(window, msg, wparam, lparam)
+        }
+
         WM_SETFOCUS => {
-            use crate::event::WindowEvent::Focused;
-            update_modifiers(window, userdata);
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: Focused(true),
-            });
-
-            result = ProcResult::Value(0);
+            let active_focus_changed = userdata.window_state.lock().set_focused(true);
+            if active_focus_changed {
+                gain_active_focus(window, userdata);
+            }
+            0
         }
 
         WM_KILLFOCUS => {
-            use crate::event::WindowEvent::{Focused, ModifiersChanged};
-
-            userdata.window_state.lock().modifiers_state = ModifiersState::empty();
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: ModifiersChanged(ModifiersState::empty()),
-            });
-
-            userdata.send_event(Event::WindowEvent {
-                window_id: RootWindowId(WindowId(window)),
-                event: Focused(false),
-            });
-            result = ProcResult::Value(0);
+            let active_focus_changed = userdata.window_state.lock().set_focused(false);
+            if active_focus_changed {
+                lose_active_focus(window, userdata);
+            }
+            0
         }
 
         WM_SETCURSOR => {
@@ -1784,10 +1873,15 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 Some(cursor) => {
                     let cursor = LoadCursorW(0, cursor.to_windows_cursor());
                     SetCursor(cursor);
-                    result = ProcResult::Value(0);
+                    0
                 }
-                None => result = ProcResult::DefWindowProc(wparam),
+                None => DefWindowProcW(window, msg, wparam, lparam),
             }
+        }
+
+        WM_DROPFILES => {
+            // See `FileDropHandler` for implementation.
+            0
         }
 
         WM_GETMINMAXINFO => {
@@ -1836,8 +1930,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 window_state.scale_factor = new_scale_factor;
 
                 if new_scale_factor == old_scale_factor {
-                    result = ProcResult::Value(0);
-                    return;
+                    return 0;
                 }
 
                 window_state.fullscreen.is_none()
@@ -2049,7 +2142,7 @@ unsafe fn public_window_callback_inner<T: 'static>(
 
                 if window_state.current_theme != new_theme {
                     window_state.current_theme = new_theme;
-                    mem::drop(window_state);
+                    drop(window_state);
                     userdata.send_event(Event::WindowEvent {
                         window_id: RootWindowId(WindowId(window)),
                         event: ThemeChanged(new_theme),
@@ -2068,9 +2161,13 @@ unsafe fn public_window_callback_inner<T: 'static>(
                 window_state.set_window_flags_in_place(|f| {
                     f.set(WindowFlags::MARKER_RETAIN_STATE_ON_SIZE, wparam != 0)
                 });
-                result = ProcResult::Value(0);
+                0
+            } else if msg == *TASKBAR_CREATED {
+                let window_state = userdata.window_state.lock();
+                set_skip_taskbar(window, window_state.skip_taskbar);
+                DefWindowProcW(window, msg, wparam, lparam)
             } else {
-                result = ProcResult::DefWindowProc(wparam);
+                DefWindowProcW(window, msg, wparam, lparam)
             }
         }
     };
@@ -2156,8 +2253,104 @@ unsafe extern "system" fn thread_event_target_callback<T: 'static>(
         }
 
         WM_INPUT => {
-            if let Some(data) = raw_input::get_raw_input_data(lparam as _) {
-                handle_raw_input(&userdata, data);
+            use crate::event::{
+                DeviceEvent::{Button, Key, Motion, MouseMotion, MouseWheel},
+                ElementState::{Pressed, Released},
+                MouseScrollDelta::LineDelta,
+            };
+
+            if let Some(data) = raw_input::get_raw_input_data(lparam) {
+                let device_id = wrap_device_id(data.header.hDevice as u32);
+
+                if data.header.dwType == RIM_TYPEMOUSE {
+                    let mouse = data.data.mouse;
+
+                    if util::has_flag(mouse.usFlags as u32, MOUSE_MOVE_RELATIVE) {
+                        let x = mouse.lLastX as f64;
+                        let y = mouse.lLastY as f64;
+
+                        if x != 0.0 {
+                            userdata.send_event(Event::DeviceEvent {
+                                device_id,
+                                event: Motion { axis: 0, value: x },
+                            });
+                        }
+
+                        if y != 0.0 {
+                            userdata.send_event(Event::DeviceEvent {
+                                device_id,
+                                event: Motion { axis: 1, value: y },
+                            });
+                        }
+
+                        if x != 0.0 || y != 0.0 {
+                            userdata.send_event(Event::DeviceEvent {
+                                device_id,
+                                event: MouseMotion { delta: (x, y) },
+                            });
+                        }
+                    }
+
+                    let mouse_button_flags = mouse.Anonymous.Anonymous.usButtonFlags;
+
+                    if util::has_flag(mouse_button_flags as u32, RI_MOUSE_WHEEL) {
+                        let delta = mouse.Anonymous.Anonymous.usButtonData as i16 as f32
+                            / WHEEL_DELTA as f32;
+                        userdata.send_event(Event::DeviceEvent {
+                            device_id,
+                            event: MouseWheel {
+                                delta: LineDelta(0.0, delta),
+                            },
+                        });
+                    }
+
+                    let button_state =
+                        raw_input::get_raw_mouse_button_state(mouse_button_flags as u32);
+                    // Left, middle, and right, respectively.
+                    for (index, state) in button_state.iter().enumerate() {
+                        if let Some(state) = *state {
+                            // This gives us consistency with X11, since there doesn't
+                            // seem to be anything else reasonable to do for a mouse
+                            // button ID.
+                            let button = (index + 1) as u32;
+                            userdata.send_event(Event::DeviceEvent {
+                                device_id,
+                                event: Button { button, state },
+                            });
+                        }
+                    }
+                } else if data.header.dwType == RIM_TYPEKEYBOARD {
+                    let keyboard = data.data.keyboard;
+
+                    let pressed =
+                        keyboard.Message == WM_KEYDOWN || keyboard.Message == WM_SYSKEYDOWN;
+                    let released = keyboard.Message == WM_KEYUP || keyboard.Message == WM_SYSKEYUP;
+
+                    if pressed || released {
+                        let state = if pressed { Pressed } else { Released };
+
+                        let scancode = keyboard.MakeCode;
+                        let extended = util::has_flag(keyboard.Flags, RI_KEY_E0 as u16)
+                            | util::has_flag(keyboard.Flags, RI_KEY_E1 as u16);
+
+                        if let Some((vkey, scancode)) =
+                            handle_extended_keys(keyboard.VKey, scancode as u32, extended)
+                        {
+                            let virtual_keycode = vkey_to_winit_vkey(vkey);
+
+                            #[allow(deprecated)]
+                            userdata.send_event(Event::DeviceEvent {
+                                device_id,
+                                event: Key(KeyboardInput {
+                                    scancode,
+                                    state,
+                                    virtual_keycode,
+                                    modifiers: event::get_key_mods(),
+                                }),
+                            });
+                        }
+                    }
+                }
             }
 
             DefWindowProcW(window, msg, wparam, lparam)
@@ -2216,7 +2409,7 @@ unsafe extern "system" fn thread_event_target_callback<T: 'static>(
         .catch_unwind(callback)
         .unwrap_or(-1);
     if userdata_removed {
-        mem::drop(userdata);
+        drop(userdata);
     } else {
         Box::into_raw(userdata);
     }
